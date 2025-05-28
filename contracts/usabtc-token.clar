@@ -1,6 +1,5 @@
-
-;; title: USABTC Token Contract
-;; version: 1.0.0
+;; title: USABTC Token Contract with Bitcoin Wallet Governance
+;; version: 1.0.1
 ;; summary: USABTC is a specialized fungible token implemented on the Stacks blockchain.
 ;; description: USABTC is designed to provide a unique economic mechanism that bridges Bitcoin
 ;; and the US financial system through the decentralized and secure Stacks network. USABTC
@@ -40,13 +39,21 @@
 (define-constant USABTC_EXIT_TAX u10) ;; 10% exit tax
 (define-constant EXIT_TAX_DELAY u21000) ;; approx 4.8 months in Bitcoin block time
 
+;; Bitcoin governance constants
+(define-constant structured-data-prefix 0x534950303138) ;; SIP-018 
+(define-constant message-domain {name: "USABTC_GOVERNANCE", version: "v1.0", chain-id: chain-id})
+(define-constant message-domain-hash (sha256 (unwrap-panic (to-consensus-buff? message-domain))))
+(define-constant structured-data-header (concat structured-data-prefix message-domain-hash))
+
 ;; error codes
 (define-constant ERR_NOT_CUSTODIAN_WALLET (err u1000))
 (define-constant ERR_SAME_AS_CURRENT_CUSTODIAN (err u1001))
 (define-constant ERR_NOT_TOKEN_OWNER (err u1002))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u1003))
 (define-constant ERR_INVALID_AMOUNT (err u1004))
-
+(define-constant ERR_INVALID_SIGNATURE (err u1005))
+(define-constant ERR_CONSENSUS_BUFF (err u1006))
+(define-constant ERR_UUID_SUBMITTED (err u1007))
 
 ;; data vars
 ;;
@@ -58,7 +65,36 @@
 (define-data-var active-exit-tax-activation-block uint u0)
 ;; destination wallet for exit tax funds and responsibilities
 ;; temporarily set to deployer and blocked from enabling exit tax
-(define-data-var custodian-trust-wallet principal USABTC_CONTRACT_DEPLOYER)
+
+;; Bitcoin Treasury governance data
+(define-data-var custodian-trust-wallet principal USABTC_CONTRACT_DEPLOYER) ;; this is set to the Stacks address derived from the Bitcoin Wallet public key 
+
+;; Replay protection for governance signatures
+(define-map submitted-gov-uuids (string-ascii 36) bool)
+
+;; === BITCOIN SIGNATURE VERIFICATION ===
+(define-private (hash-governance-message
+    (action (string-ascii 32))
+    (uuid (string-ascii 36)))
+  (sha256 (concat structured-data-header (sha256 
+    (unwrap-panic (to-consensus-buff? {action: action, uuid: uuid}))))))
+
+(define-private (who-signed-governance
+    (action (string-ascii 32))
+    (uuid (string-ascii 36))
+    (signature (buff 65)))
+  (let ((message-hash (hash-governance-message action uuid)))
+    (match (secp256k1-recover? message-hash signature)
+      public-key (principal-of? public-key)
+      error ERR_INVALID_SIGNATURE)))
+
+(define-private (is-btc-usa-treasurer
+    (action (string-ascii 32))
+    (uuid (string-ascii 36))
+    (signature (buff 65)))
+  (match (who-signed-governance action uuid signature)
+    ok-value (is-eq ok-value (var-get custodian-trust-wallet))
+    err-value false))
 
 ;; public functions
 ;;
@@ -73,7 +109,7 @@
       (print memo)
       none
     )
-    ;; print event
+    ;; print event    
     (print {
       notification: "usabtc-transfer",
       payload: {
@@ -83,7 +119,7 @@
         sender: sender
       }
     })
-    ;; make transfer
+     ;; make transfer
     (ft-transfer? usabtc amount sender recipient)
   )
 )
@@ -93,7 +129,7 @@
 (define-public (deposit (amount uint))
   (begin
     ;; make sure it's more than 0
-    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+      (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     ;; transfer sBTC to this contract
     ;; MAINNET: 'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token
     (try! (contract-call? .sbtc-token transfer amount tx-sender USABTC_CONTRACT none))
@@ -151,57 +187,70 @@
   )
 )
 
-;; governance functions
+;; === BITCOIN GOVERNANCE FUNCTIONS ===
+;;
+(define-public (enable-exit-tax (uuid (string-ascii 36)) (signature (buff 65)))
+  (if (map-insert submitted-gov-uuids uuid true)
+    (begin
+      ;; verify sender is not deployer
+      (asserts! (not (is-eq tx-sender USABTC_CONTRACT_DEPLOYER)) ERR_NOT_CUSTODIAN_WALLET)
+      ;; Verify Bitcoin treasury signature
+      (asserts! (is-btc-usa-treasurer "ENABLE_EXIT_TAX" uuid signature) ERR_NOT_CUSTODIAN_WALLET)
+      ;; set previous if no change is pending
+      (and (not (is-change-pending)) (var-set previous-exit-tax (var-get active-exit-tax)))
+      ;; set active to 10 with constant
+      (var-set active-exit-tax USABTC_EXIT_TAX)
+      ;; update activation block
+      (var-set active-exit-tax-activation-block (+ burn-block-height EXIT_TAX_DELAY))
+      ;; print event
+      (print {
+        notification: "usabtc-exit-tax-enabled",
+        payload: {
+          activation-block: (var-get active-exit-tax-activation-block),
+          active-exit-tax: USABTC_EXIT_TAX,
+          previous-exit-tax: (var-get previous-exit-tax),
+          signed-by-btc-treasury: true
+        }
+      })
+      (ok true)
+    )
+    ERR_UUID_SUBMITTED))
 
-(define-public (enable-exit-tax)
-  (begin
-    ;; verify sender is not deployer
-    (asserts! (not (is-eq tx-sender USABTC_CONTRACT_DEPLOYER)) ERR_NOT_CUSTODIAN_WALLET)
-    ;; verify sender is custodian
-    (asserts! (is-eq tx-sender (var-get custodian-trust-wallet)) ERR_NOT_CUSTODIAN_WALLET)
-    ;; set previous if no change is pending
-    (and (not (is-change-pending)) (var-set previous-exit-tax (var-get active-exit-tax)))
-    ;; set active to 10 with constant
-    (var-set active-exit-tax USABTC_EXIT_TAX)
-    ;; update activation block
-    (var-set active-exit-tax-activation-block (+ burn-block-height EXIT_TAX_DELAY))
-    ;; print event
-    (print {
-      notification: "usabtc-exit-tax-enabled",
-      payload: {
-        activation-block: (var-get active-exit-tax-activation-block),
-        active-exit-tax: USABTC_EXIT_TAX,
-        previous-exit-tax: (var-get previous-exit-tax)
-      }
-    })
-    (ok true)
-  )
-)
+(define-public (disable-exit-tax (uuid (string-ascii 36)) (signature (buff 65)))
+  (if (map-insert submitted-gov-uuids uuid true)
+    (begin 
+      ;; Verify Bitcoin treasury signature
+      (asserts! (is-btc-usa-treasurer "DISABLE_EXIT_TAX" uuid signature) ERR_NOT_CUSTODIAN_WALLET)
+      ;; set previous if no change is pending
+      (and (not (is-change-pending)) (var-set previous-exit-tax (var-get active-exit-tax)))
+      ;; set active to 0
+      (var-set active-exit-tax u0)
+      ;; update activation block
+      (var-set active-exit-tax-activation-block (+ burn-block-height EXIT_TAX_DELAY))
+      ;; print event
+      (print {
+        notification: "usabtc-exit-tax-disabled",
+        payload: {
+          activation-block: (var-get active-exit-tax-activation-block),
+          active-exit-tax: u0,
+          previous-exit-tax: (var-get previous-exit-tax),
+          signed-by-btc-treasury: true
+        }
+      })
+      (ok true)
+    )
+    ERR_UUID_SUBMITTED))
 
-(define-public (disable-exit-tax)
-  (begin
-    ;; verify sender is not deployer
-    (asserts! (not (is-eq tx-sender USABTC_CONTRACT_DEPLOYER)) ERR_NOT_CUSTODIAN_WALLET)
-    ;; verify sender is custodian
-    (asserts! (is-eq tx-sender (var-get custodian-trust-wallet)) ERR_NOT_CUSTODIAN_WALLET)
-    ;; set previous if no change is pending
-    (and (not (is-change-pending)) (var-set previous-exit-tax (var-get active-exit-tax)))
-    ;; set active to 0
-    (var-set active-exit-tax u0)
-    ;; update activation block
-    (var-set active-exit-tax-activation-block (+ burn-block-height EXIT_TAX_DELAY))
-    ;; print event
-    (print {
-      notification: "usabtc-exit-tax-disabled",
-      payload: {
-        activation-block: (var-get active-exit-tax-activation-block),
-        active-exit-tax: u0,
-        previous-exit-tax: (var-get previous-exit-tax)
-      }
-    })
-    (ok true)
-  )
-)
+;; Helper function: Get Stacks address from Bitcoin signature
+(define-read-only (get-stx-address-from-btc-signature
+    (action (string-ascii 32))
+    (uuid (string-ascii 36))
+    (signature (buff 65)))
+  (who-signed-governance action uuid signature))
+
+;; Legacy governance functions (kept for backwards compatibility)
+;; Copy paste the legacy ones to enable stacks contract call directly
+;; Less elegant
 
 (define-public (update-custodian-wallet (new-custodian-wallet principal))
   (begin
@@ -226,11 +275,13 @@
 ;; read only functions
 ;;
 
-;; exit tax functions
+;; Bitcoin governance read-only functions
+(define-read-only (check-gov-uuid (uuid (string-ascii 36)))
+  (ok (is-some (map-get? submitted-gov-uuids uuid))))
 
+;; exit tax functions
 (define-read-only (is-change-pending)
-  (> (var-get active-exit-tax-activation-block) burn-block-height)
-)
+  (> (var-get active-exit-tax-activation-block) burn-block-height))
 
 (define-read-only (get-exit-tax-values)
   {
